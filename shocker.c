@@ -1,31 +1,102 @@
 #define _GNU_SOURCE
-#include <sys/wait.h> // waitpid
+#include <stdlib.h>
+#include <stdbool.h>
 #include <sched.h> // clone, all the clone Flags
 #include <unistd.h> // execvp, sethostname
 #include <string.h> // strlen
 #include <stdio.h> // puts, printf
 #include <sys/mount.h> // mount
+#include <sys/stat.h> // mkdir
+#include <sys/types.h> // Flags for sys stuff
+#include <sys/mman.h>
+#include <sys/wait.h> // waitpid
+#include <errno.h>
 
-#define STACK_SIZE (1024 * 1024)
+static const size_t stack_size = 2 * 1024 * 1024;  /* Stack size for cloned child */
 
 //   docker run image <cmd> <params>
 //./shocker run       <cmd> <params>
 
-static char child_stack[STACK_SIZE]; /* Stack size for cloned child */
-
 int child(void *arg) {
-  sethostname("Container", 10);
-  chdir("/root/container");
-  chroot("/root/container"); // this is the main part of hiding
-  mount("proc", "/proc", "proc", 0, NULL); // proc is a pseudo-fs, used by many tools
-  char **shell = (char **)arg;
-  execvp(shell[0], shell);
-  return 0;
+  static const char *hostname = "blah";
+  if (sethostname(hostname, strnlen(hostname, 100)) == -1) {
+    perror("sethostname failed with: ");
+    goto fail_sethostname;
+  }
+
+  if (chdir("/root/container") == -1) {
+    perror("sethostname failed with: ");
+    goto fail_chdir;
+  }
+
+  if (chroot("/root/container") == -1) {
+    perror("sethostname failed with: ");
+    goto fail_chroot;
+  }
+
+  if (mount("proc", "/proc", "proc", 0, NULL) == -1) {
+    perror("mount failed with: ");
+    goto fail_mount;
+  }
+
+  char **shell = arg;
+
+  if (execvp(shell[0], shell) == -1) {
+    perror("execvp failed with: ");
+    goto fail_execvp;
+  }
+
+  if (umount("/root/container/proc") == -1) {
+    perror("umount failed with: ");
+    goto fail_umount;
+  }
+
+  exit(EXIT_SUCCESS);
+
+  fail_umount:
+  fail_execvp:
+    umount("/root/container/proc");
+  fail_mount:
+  fail_chroot:
+  fail_chdir:
+  fail_sethostname:
+    exit(EXIT_FAILURE);
+}
+
+static bool intWriter(char* path, int num) {
+  FILE *fp = fopen(path, "w");
+
+  if (fp == NULL) {
+    fprintf(stderr, "fopen %s failed with: %s", path, strerror(errno));
+    goto fail_fopen;
+  }
+
+  if (fprintf(fp, "%d", num) == -1) {
+    fprintf(stderr, "fprintf %s with %d failed with: %s", path, num, strerror(errno));
+    goto fail_fprintf;
+  }
+
+  fclose(fp);
+  return true;
+
+  fail_fprintf:
+    fclose(fp);
+  fail_fopen:
+    return false;
 }
 
 int run(char *argv[]) {
-  // Fork and exec pattern in now the clone and exec pattern
-  int child_pid = clone(child, child_stack+STACK_SIZE, 
+
+  /* Allocate memory to be used for the stack of the child */
+  char *stack = mmap(NULL, stack_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0);
+
+  if (stack == MAP_FAILED) {
+    perror("mmap failed with: ");
+    goto fail_mmap;
+  }
+
+  // Fork and exec pattern is now the clone and exec pattern
+  int child_pid = clone(child, stack + stack_size,
       CLONE_NEWUTS | // unix timesharing, allows changing of hostname 
       CLONE_NEWPID | // procfs is one of a few ways to pass process info, OSX has no procfs
       CLONE_NEWNS | // first namespace (for mounts). Private copy of its namespace.
@@ -33,28 +104,58 @@ int run(char *argv[]) {
       SIGCHLD, // signal sent to the parent when the child terminates
       argv + 1 // drop `run` arg
   );
-  // create /sys/fs/cgroup/pids/shocker prior to running
-  FILE *fp = fopen("/sys/fs/cgroup/pids/shocker/cgroup.procs", "w");
-  fprintf(fp, "%d", child_pid); // write child pid to the cgroup.procs procfs
-  fclose(fp);
-  waitpid(child_pid, NULL , 0); // NULL is whether to write status, 0 
-  umount("/root/container/proc");
-  return 0;
+
+  if (child_pid == -1) {
+    perror("clone failed with: ");
+    goto fail_clone;
+  }
+
+  const char *cgroup_dir = "/sys/fs/cgroup/pids/shocker";
+
+  // make a new cgroup
+  if (mkdir(cgroup_dir, 0644) == -1) {
+    perror("mkdir failed with: ");
+    goto fail_mkdir;
+  }
+
+  // Restrain procs in this cgroup to a max of 5 processes
+  if (!intWriter("/sys/fs/cgroup/pids/shocker/pids.max", 5)) goto fail_pidsmax;
+
+  // Put the child in the new cgroup
+  if (!intWriter("/sys/fs/cgroup/pids/shocker/cgroup.procs", child_pid)) goto fail_cgroupprocs;
+
+  if (waitpid(child_pid, NULL , 0) == -1) {
+    perror("waitpid failed with ");
+    goto fail_waitpid;
+  }
+
+  exit(EXIT_SUCCESS);
+
+  fail_waitpid:
+  fail_cgroupprocs:
+  fail_pidsmax:
+    rmdir(cgroup_dir);
+  fail_mkdir:
+    kill(child_pid, SIGTERM);
+  fail_clone:
+    munmap(stack, stack_size);
+  fail_mmap:
+    exit(EXIT_FAILURE);;
 }
 
-// need just stdio, and string for main
 
+// need just stdio, and string for main
 int main(int argc, char *argv[]) {
   if (argc < 3) {
-    puts("Not enough arguments.\n");
-    return 1;
+    printf("Not enough arguments.\n");
+    exit(EXIT_FAILURE);
   }
   argv += 1; // drop binary argument
-  if (strcmp(argv[0], "run") == 0) {
+  if (strncmp(argv[0], "run", 5) == 0) {
       run(argv);
   } else {
-    puts( "Invalid arguments.");
-    return 1;
+    printf( "Invalid arguments.");
+    exit(EXIT_FAILURE);
   }
 }
 

@@ -1,4 +1,6 @@
 build/
-container/
 shocker
 .bash_history
+.viminfo
+.config
+*.dSYM
